@@ -1,0 +1,31 @@
+# 水母语音输入 whisper-jellyfish — 运行依赖
+# 已在 macOS (Apple Silicon) + Python 3.12 ~ 3.14 上验证可一键安装
+
+# 录音 / 音频
+numpy
+sounddevice
+soundfile
+
+# 键盘热键 / 剪贴板 / 环境变量
+pynput
+pyperclip
+python-dotenv
+
+# 网络（豆包流式 ASR、可选翻译/润色等用到）
+requests
+aiohttp
+
+# 兼容保留：OpenAI SDK 与繁简转换（模块加载时会 import，即使纯本地模式也需要）
+openai
+opencc-python-reimplemented
+
+# macOS 原生 UI（菜单栏 / 桌面水母）、键盘监听、辅助功能
+# 注意：pyobjc 必须 11+ 才有 Python 3.13/3.14 的预编译 wheel，旧版会编译失败
+pyobjc-core>=11
+pyobjc-framework-Cocoa>=11
+pyobjc-framework-Quartz>=11
+pyobjc-framework-CoreText>=11
+pyobjc-framework-ApplicationServices>=11
+
+# 本地转录引擎（Apple Silicon 原生推理，完全免费，无需 API key）
+mlx-whisper
