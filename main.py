@@ -108,7 +108,8 @@ class VoiceAssistant:
 
         # 桌面宠物水母：可拖拽悬浮窗，点击 = 切换录音（等同 Ctrl+F）
         self.desktop_pet = DesktopPetWindow(
-            on_click=self._toggle_recording_from_pet
+            on_click=self._toggle_recording_from_pet,
+            max_record_seconds=self.audio_recorder.max_record_duration,
         )
 
         # 设置自动停止录音的回调
@@ -129,19 +130,31 @@ class VoiceAssistant:
         self._notify_status()
 
     def _handle_auto_stop(self):
-        """处理自动停止录音的情况"""
-        logger.warning("⏰ 录音时间已达到最大限制，自动中止录音！")
+        """处理自动停止录音的情况：到达最大时长后【保存并转录】已录内容，
+        而不是丢弃。逻辑与设备断开时一致——避免说太久结果全丢。"""
+        logger.warning("⏰ 录音时间已达最大限制，自动停止并转录已录内容")
 
-        # 中止录音（不进行转录）
-        if self._current_state == InputState.DOUBAO_STREAMING:
-            self.audio_recorder.stop_streaming_recording(abort=True)
+        # 根据当前状态调用相应的 stop 方法（与 _handle_device_disconnect 一致）
+        if (
+            self._current_state == InputState.RECORDING
+            and self.transcription_service == "doubao"
+            and self.doubao_processor
+            and self.doubao_processor.is_available()
+        ):
+            self.stop_doubao_streaming()
+        elif self._current_state == InputState.RECORDING:
+            self.stop_openai_recording()
+        elif self._current_state == InputState.RECORDING_TRANSLATE:
+            self.stop_translation_recording()
+        elif self._current_state == InputState.RECORDING_KIMI:
+            self.stop_local_recording()
+        elif self._current_state == InputState.DOUBAO_STREAMING:
+            self.stop_doubao_streaming()
         else:
-            self.audio_recorder.stop_recording(abort=True)
+            # 非录音状态，只重置
+            self.keyboard_manager.reset_state()
 
-        # 重置键盘状态
-        self.keyboard_manager.reset_state()
-
-        logger.info("💡 录音已中止，状态已重置")
+        logger.info("💡 已自动停止录音并提交转录")
 
     def _handle_device_disconnect(self):
         """处理设备断开时的录音停止（保存并转录已录制内容）"""

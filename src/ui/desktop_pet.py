@@ -9,18 +9,26 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from typing import Callable, Dict, Optional, Tuple
 
 import objc
 from AppKit import (
+    NSBezierPath,
     NSColor,
     NSCompositingOperationClear,
     NSEvent,
+    NSFont,
+    NSFontAttributeName,
+    NSForegroundColorAttributeName,
     NSImage,
     NSMakeRect,
+    NSMutableParagraphStyle,
     NSPanel,
+    NSParagraphStyleAttributeName,
     NSRectFillUsingOperation,
     NSScreen,
+    NSTextAlignmentCenter,
     NSTimer,
     NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -29,6 +37,7 @@ from AppKit import (
     NSWindowStyleMaskNonactivatingPanel,
     NSPopUpMenuWindowLevel,
 )
+from Foundation import NSString
 from PyObjCTools import AppHelper
 
 from src.keyboard.inputState import InputState
@@ -64,6 +73,17 @@ _MOTION_SPEED = {"float": 0.18, "wobble": 0.16, "idle": 0.08}
 _ROTATE_SECONDS = 2.5  # 多帧轮换间隔
 _TICK_SECONDS = 0.1
 
+# 录音状态集合：进入这些状态时启动倒计时
+_RECORDING_STATES = frozenset({
+    InputState.RECORDING,
+    InputState.RECORDING_TRANSLATE,
+    InputState.RECORDING_KIMI,
+    InputState.DOUBAO_STREAMING,
+})
+
+_LABEL_H = 20.0          # 水母下方倒计时文字条高度
+_WARN_REMAIN = 60.0      # 剩余时间低于此值时倒计时变红提醒
+
 
 class _JellyView(NSView):
     """显示当前表情图片 + 处理拖拽/点击。"""
@@ -97,9 +117,12 @@ class _JellyView(NSView):
         if isz.width <= 0 or isz.height <= 0:
             return
 
+        # 底部预留 _LABEL_H 高的文字条给倒计时，水母画在其上方的方形区域内
+        jelly_h = b.size.height - _LABEL_H
+
         # 等比缩放，留出飘动的余量
         pad = 10.0
-        avail = min(b.size.width, b.size.height) - pad * 2
+        avail = min(b.size.width, jelly_h) - pad * 2
         scale = min(avail / isz.width, avail / isz.height)
         dw = isz.width * scale
         dh = isz.height * scale
@@ -117,9 +140,46 @@ class _JellyView(NSView):
             oy = (amp * 0.6) * math.sin(phase)
 
         x = (b.size.width - dw) / 2.0 + ox
-        y = (b.size.height - dh) / 2.0 + oy
+        y = _LABEL_H + (jelly_h - dh) / 2.0 + oy
         img.drawInRect_fromRect_operation_fraction_(
             NSMakeRect(x, y, dw, dh), NSMakeRect(0, 0, isz.width, isz.height), 1, 1.0
+        )
+
+        # 倒计时（仅录音时显示）
+        remaining = owner.countdown_remaining()
+        if remaining is not None:
+            self._draw_countdown(b, remaining)
+
+    def _draw_countdown(self, bounds, remaining):
+        remaining = max(0.0, remaining)
+        mm = int(remaining) // 60
+        ss = int(remaining) % 60
+        text = NSString.stringWithString_(f"{mm}:{ss:02d}")
+
+        warn = remaining <= _WARN_REMAIN
+        color = NSColor.systemRedColor() if warn else NSColor.whiteColor()
+        para = NSMutableParagraphStyle.alloc().init()
+        para.setAlignment_(NSTextAlignmentCenter)
+        attrs = {
+            NSFontAttributeName: NSFont.boldSystemFontOfSize_(12.0),
+            NSForegroundColorAttributeName: color,
+            NSParagraphStyleAttributeName: para,
+        }
+
+        tsz = text.sizeWithAttributes_(attrs)
+        pill_w = tsz.width + 14.0
+        pill_h = _LABEL_H - 2.0
+        px = (bounds.size.width - pill_w) / 2.0
+        py = 1.0
+        pill = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(px, py, pill_w, pill_h), pill_h / 2.0, pill_h / 2.0
+        )
+        NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55).set()
+        pill.fill()
+
+        ty = py + (pill_h - tsz.height) / 2.0
+        text.drawInRect_withAttributes_(
+            NSMakeRect(px, ty, pill_w, tsz.height), attrs
         )
 
     # ---- 鼠标：原生背景拖拽由窗口处理；这里只区分"点击 vs 拖拽" ----
@@ -145,7 +205,11 @@ class DesktopPetWindow:
 
     SIZE = 96.0
 
-    def __init__(self, on_click: Optional[Callable[[], None]] = None) -> None:
+    def __init__(
+        self,
+        on_click: Optional[Callable[[], None]] = None,
+        max_record_seconds: float = 600.0,
+    ) -> None:
         self._panel: Optional[NSPanel] = None
         self._view: Optional[_JellyView] = None
         self._timer = None
@@ -155,6 +219,14 @@ class DesktopPetWindow:
         self._images: Dict[str, NSImage] = {}
         self._frame_idx: int = 0          # 当前轮换帧
         self._state_ticks: int = 0        # 进入当前状态后经过的 tick 数
+        self._max_record_seconds: float = float(max_record_seconds)
+        self._countdown_deadline: Optional[float] = None  # 录音到点的时间戳
+
+    def countdown_remaining(self) -> Optional[float]:
+        """录音中返回剩余秒数；否则 None（不显示倒计时）。"""
+        if self._countdown_deadline is None:
+            return None
+        return self._countdown_deadline - time.time()
 
     # ---- 图片缓存 ----
     def _image(self, filename: str) -> Optional[NSImage]:
@@ -214,6 +286,14 @@ class DesktopPetWindow:
     def update_state(self, state: InputState) -> None:
         def _apply():
             if state != self._state:
+                # 进入录音状态：启动倒计时；离开录音状态：清除
+                was_recording = self._state in _RECORDING_STATES
+                now_recording = state in _RECORDING_STATES
+                if now_recording and not was_recording:
+                    self._countdown_deadline = time.time() + self._max_record_seconds
+                elif not now_recording:
+                    self._countdown_deadline = None
+
                 self._state = state
                 self._frame_idx = 0       # 切状态时从第一帧开始
                 self._state_ticks = 0
@@ -227,6 +307,7 @@ class DesktopPetWindow:
         screen = NSScreen.mainScreen()
         sf = screen.frame()
         size = self.SIZE
+        win_h = size + _LABEL_H  # 多出一条放倒计时
 
         pos = self._load_position()
         if pos is None:
@@ -235,11 +316,11 @@ class DesktopPetWindow:
         else:
             x, y = pos
             x = max(0, min(x, sf.size.width - size))
-            y = max(0, min(y, sf.size.height - size))
+            y = max(0, min(y, sf.size.height - win_h))
 
         style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(x, y, size, size), style, 2, False
+            NSMakeRect(x, y, size, win_h), style, 2, False
         )
         panel.setLevel_(NSPopUpMenuWindowLevel)
         panel.setCollectionBehavior_(
@@ -255,7 +336,7 @@ class DesktopPetWindow:
         panel.setMovableByWindowBackground_(True)  # 原生背景拖拽
 
         view = _JellyView.alloc().initWithFrame_owner_(
-            NSMakeRect(0, 0, size, size), self
+            NSMakeRect(0, 0, size, win_h), self
         )
         panel.setContentView_(view)
         self._panel = panel

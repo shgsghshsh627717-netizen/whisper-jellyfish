@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import threading
 import time
@@ -11,6 +12,17 @@ from src.llm.kimi import KimiProcessor
 from ..utils.logger import logger
 
 dotenv.load_dotenv()
+
+
+def _collapse_runaway_repeats(text: str) -> str:
+    """兜底清理 Whisper 幻觉式重复：把同一段 1-6 字的子串连续重复 3 次以上
+    折叠成一次（如"当然当然当然当然"->"当然"，"谢谢谢谢"->"谢谢"）。
+    正常中文极少把同一短语连续贴 3 遍以上，所以这里很安全。"""
+    if not text:
+        return text
+    # \1 匹配 1-6 个字符的块，后面紧跟同样的块至少 2 次（共 ≥3 次）
+    collapsed = re.sub(r'(.{1,6}?)\1{2,}', r'\1', text)
+    return collapsed.strip()
 
 def timeout_decorator(seconds):
     def decorator(func):
@@ -76,13 +88,22 @@ class LocalWhisperProcessor:
     @timeout_decorator(180)
     def _call_mlx_whisper(self, wav_file):
         # initial_prompt 只给一句带标点的普通话样例（不能含指令文字，否则会产生乱码）
+        # 抗幻觉参数：结尾静音段常被模型反复吐"当然当然当然"/"谢谢谢谢"——
+        #   - condition_on_previous_text=False：不把自己上一段输出喂回去，斩断重复滚雪球
+        #   - hallucination_silence_threshold：检测到长静音就跳过，专治尾部幻觉（需 word_timestamps）
+        #   - compression_ratio_threshold：高重复文本触发温度回退重解码
         result = self._mlx_whisper.transcribe(
             wav_file,
             language="zh",
             path_or_hf_repo=self.model_repo,
             initial_prompt="你好，今天天气怎么样？我觉得还不错。",
+            condition_on_previous_text=False,
+            word_timestamps=True,
+            hallucination_silence_threshold=2.0,
+            compression_ratio_threshold=2.4,
+            no_speech_threshold=0.6,
         )
-        return result.get("text", "").strip()
+        return _collapse_runaway_repeats(result.get("text", "").strip())
 
     def process_audio(self, audio_buffer, mode="transcriptions", prompt="", archive_path=None):
         wav_file = None
