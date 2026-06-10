@@ -88,16 +88,19 @@ class LocalWhisperProcessor:
     @timeout_decorator(180)
     def _call_mlx_whisper(self, wav_file):
         # initial_prompt 只给一句带标点的普通话样例（不能含指令文字，否则会产生乱码）
-        # 抗幻觉参数：结尾静音段常被模型反复吐"当然当然当然"/"谢谢谢谢"——
-        #   - condition_on_previous_text=False：不把自己上一段输出喂回去，斩断重复滚雪球
+        # 抗幻觉参数（结尾静音段常被模型反复吐"当然当然当然"/"谢谢谢谢"）：
+        #   - condition_on_previous_text=True：保留前文语境，让标点风格在长音频的
+        #     逐段(30s)窗口间传递下去；设为 False 会导致长句越往后标点越少。
+        #     重复幻觉改由下面三道防线兜（不靠切断上下文）。
         #   - hallucination_silence_threshold：检测到长静音就跳过，专治尾部幻觉（需 word_timestamps）
         #   - compression_ratio_threshold：高重复文本触发温度回退重解码
+        #   - _collapse_runaway_repeats：转录后兜底折叠疯狂重复，与 prompt 设置无关
         result = self._mlx_whisper.transcribe(
             wav_file,
             language="zh",
             path_or_hf_repo=self.model_repo,
             initial_prompt="你好，今天天气怎么样？我觉得还不错。",
-            condition_on_previous_text=False,
+            condition_on_previous_text=True,
             word_timestamps=True,
             hallucination_silence_threshold=2.0,
             compression_ratio_threshold=2.4,
