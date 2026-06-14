@@ -619,6 +619,8 @@ def main():
         os.environ["SERVICE_PLATFORM"] = "local"
         try:
             local_processor = LocalWhisperProcessor()
+            # 启动时预热模型，避免用户第一次按热键时卡 60-80 秒（mlx 首次 JIT 编译 GPU 内核）
+            local_processor.warmup()
         except FileNotFoundError as e:
             logger.warning(f"本地 Whisper 不可用，将禁用本地转录功能: {e}")
             local_processor = None

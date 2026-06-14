@@ -24,6 +24,21 @@ def _collapse_runaway_repeats(text: str) -> str:
     collapsed = re.sub(r'(.{1,6}?)\1{2,}', r'\1', text)
     return collapsed.strip()
 
+
+# 独立的 "cloud" 词（前后都不挨别的字母）才纠正为 "Claude"。
+# 这样 iCloud（前面挨着 i）、Cloudflare（后面挨着 flare）等真含 cloud 的词不受影响。
+_CLOUD_RE = re.compile(r'(?<![A-Za-z])cloud(?![A-Za-z])', re.IGNORECASE)
+
+
+def _fix_claude_misrecognition(text: str) -> str:
+    """Whisper 常把中文语流里说的英文 "Claude" 听成 "cloud"。
+    用户绝大多数时候说的是 Claude，所以把孤立的 cloud 纠正回 Claude，
+    但保留 iCloud / Cloudflare 这类真正含 cloud 的词。"""
+    if not text:
+        return text
+    return _CLOUD_RE.sub("Claude", text)
+
+
 def timeout_decorator(seconds):
     def decorator(func):
         @wraps(func)
@@ -85,6 +100,45 @@ class LocalWhisperProcessor:
         finally:
             temp_file.close()
 
+    def warmup(self):
+        """启动时预热：mlx 会为每种张量形状单独 JIT 编译 Metal 内核，
+        长音频解码出很多 token → 很多形状 → 首次转录要现编译 60-80 秒。
+        编译结果只缓存在进程内存里，一重启就清空，所以每次新进程的第一句都会卡。
+        这里在启动阶段拿一段合成噪声跑一次完整转录（含 word_timestamps 路径），
+        把这些内核提前编译好，用户真正按热键时第一句就是快的（~5 秒内）。"""
+        import io
+        import wave
+        try:
+            import numpy as np
+        except ImportError:
+            logger.info("跳过模型预热（缺少 numpy）")
+            return
+
+        logger.info("正在预热 mlx-whisper 模型（首次需编译 GPU 内核，约 10-20 秒，仅启动时一次）...")
+        start = time.time()
+        sr = 16000
+        sig = (np.random.randn(sr * 3) * 800).astype(np.int16)
+        buf = io.BytesIO()
+        wf = wave.open(buf, "wb")
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(sig.tobytes())
+        wf.close()
+        buf.seek(0)
+        wav_file = self._save_audio_to_temp_file(buf)
+        try:
+            self._call_mlx_whisper(wav_file)
+            logger.info(f"模型预热完成，耗时 {time.time() - start:.1f}秒，之后转录会很快")
+        except Exception as e:
+            logger.warning(f"模型预热失败（不影响使用，仅首句会慢）: {e}")
+        finally:
+            if wav_file and os.path.exists(wav_file):
+                try:
+                    os.unlink(wav_file)
+                except Exception:
+                    pass
+
     @timeout_decorator(180)
     def _call_mlx_whisper(self, wav_file):
         # initial_prompt 只给一句带标点的普通话样例（不能含指令文字，否则会产生乱码）
@@ -99,14 +153,15 @@ class LocalWhisperProcessor:
             wav_file,
             language="zh",
             path_or_hf_repo=self.model_repo,
-            initial_prompt="你好，今天天气怎么样？我觉得还不错。",
+            initial_prompt="你好，今天天气怎么样？我觉得还不错。我在用 Claude 写代码。",
             condition_on_previous_text=True,
             word_timestamps=True,
             hallucination_silence_threshold=2.0,
             compression_ratio_threshold=2.4,
             no_speech_threshold=0.6,
         )
-        return _collapse_runaway_repeats(result.get("text", "").strip())
+        text = _collapse_runaway_repeats(result.get("text", "").strip())
+        return _fix_claude_misrecognition(text)
 
     def process_audio(self, audio_buffer, mode="transcriptions", prompt="", archive_path=None):
         wav_file = None

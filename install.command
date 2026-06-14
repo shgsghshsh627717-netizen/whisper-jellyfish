@@ -24,9 +24,20 @@ fi
 PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 echo "✅ 找到 Python $PYVER"
 
-# ---------- 2. 创建虚拟环境 ----------
-if [ ! -d ".venv" ]; then
+# ---------- 2. 创建/校验虚拟环境 ----------
+# 注意：项目放在 iCloud 里时，旧机器的 .venv 会被同步到新机器，但 venv 绑定机器、
+# 不能跨机直接复用。这里实测当前机器能否真正用它，不行就重建——这样换一台 Mac
+# 双击本文件即可，无需手动删 .venv。
+NEED_BUILD=0
+if [ ! -x ".venv/bin/python" ]; then
+  NEED_BUILD=1
+elif ! .venv/bin/python -c "import mlx_whisper, sounddevice" >/dev/null 2>&1; then
+  echo "♻️  检测到 .venv 不适用于本机（可能来自另一台同步过来的 Mac），将重建…"
+  NEED_BUILD=1
+fi
+if [ "$NEED_BUILD" = "1" ]; then
   echo "🐍 正在创建虚拟环境 .venv …"
+  rm -rf .venv
   python3 -m venv .venv
 fi
 source .venv/bin/activate
